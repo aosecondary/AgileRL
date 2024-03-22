@@ -397,6 +397,69 @@ class PPO:
                 state_values.cpu().data.numpy(),
             )
 
+    def getActionMask(self, state, action=None, grad=False, action_mask=None):
+        """Returns the next action to take in the environment, with support for action masking.
+
+        :param state: Environment observation, or multiple observations in a batch
+        :type state: numpy.ndarray[float]
+        :param action: Action in environment to evaluate, defaults to None
+        :type action: torch.Tensor(), optional
+        :param grad: Calculate gradients on actions, defaults to False
+        :type grad: bool, optional
+        :param action_mask: Mask of legal actions 1=legal 0=illegal, defaults to None
+        :type action_mask: numpy.ndarray, optional
+        """
+        state = self.prepare_state(state)
+        if action_mask is not None:
+            if self.accelerator is None:
+                action_mask = torch.tensor(action_mask, dtype=torch.bool, device=self.device)
+            else:
+                action_mask = torch.tensor(action_mask, dtype=torch.bool, device=self.accelerator.device)
+
+        if not grad:
+            self.actor.eval()
+            self.critic.eval()
+            with torch.no_grad():
+                action_values = self.actor(state)
+                if action_mask is not None:
+                    action_values = action_values.masked_fill(~action_mask, float('-inf'))
+                state_values = self.critic(state).squeeze(-1)
+            self.actor.train()
+            self.critic.train()
+        else:
+            action_values = self.actor(state)
+            if action_mask is not None:
+                action_values = action_values.masked_fill(~action_mask, float('-inf'))
+            state_values = self.critic(state).squeeze(-1)
+
+        if self.discrete_actions:
+            dist = Categorical(logits=action_values)  # Use logits to handle masked actions
+        else:
+            cov_mat = torch.diag(self.action_var).unsqueeze(dim=0)
+            dist = MultivariateNormal(action_values, cov_mat)
+
+        return_tensors = True
+        if action is None:
+            action = dist.sample()
+            return_tensors = False
+        elif self.accelerator is None:
+            action = action.to(self.device)
+        else:
+            action = action.to(self.accelerator.device)
+
+        action_logprob = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+
+        if return_tensors:
+            return action, action_logprob, dist_entropy, state_values
+        else:
+            return (
+                action.cpu().data.numpy(),
+                action_logprob.cpu().data.numpy(),
+                dist_entropy.cpu().data.numpy(),
+                state_values.cpu().data.numpy(),
+            )
+
     def learn(self, experiences, noise_clip=0.5, policy_noise=0.2):
         """Updates agent network parameters to learn from experiences.
 
